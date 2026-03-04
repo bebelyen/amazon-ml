@@ -18,10 +18,11 @@ Companies often collect basic demographic information at sign-up, but transactio
 
 ```
 .
-├── tubi_interview.Rmd        # Main analysis: preprocessing, feature engineering, modeling
-├── README.md                 # This file
-├── .gitignore                # Excludes data files and outputs
+├── tubi_interview.Rmd       # Main analysis: preprocessing, feature engineering, modeling
+├── README.md                # This file
+├── .gitignore                      # Excludes data files and outputs
 └── submission.csv            # (Generated on run) Final test set predictions
+└── feature_queries.sql      # mirrors feature engineering demonstrating how the same pipeline would be implemented in SQL on a production data warehouse.
 ```
 
 > **Note:** The raw data files (`survey_train_test.csv`, `amazon-purchases.csv`) are not included in this repository due to size and licensing. See [Data Setup](#data-setup) below.
