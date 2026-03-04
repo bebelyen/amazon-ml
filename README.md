@@ -21,7 +21,7 @@ Companies often collect basic demographic information at sign-up, but transactio
 ├── tubi_interview.Rmd       # Main analysis: preprocessing, feature engineering, modeling
 ├── README.md                # This file
 ├── .gitignore                      # Excludes data files and outputs
-└── submission.csv            # (Generated on run) Final test set predictions
+├── submission.csv            # (Generated on run) Final test set predictions
 └── feature_queries.sql      # mirrors feature engineering demonstrating how the same pipeline would be implemented in SQL on a production data warehouse.
 ```
 
@@ -82,6 +82,24 @@ Raw purchase records were aggregated per user into numeric features. Key design 
   - `n_kid_items`: purchases in categories like diapers, toys, baby gear
 
   These were motivated by the hypothesis that larger or family households purchase consumables and child products at higher rates.
+
+## My Contributions
+
+This project was completed in a team of three. My personal contributions were:
+
+**Feature Engineering**
+I designed and implemented the full feature engineering pipeline in both R and SQL.
+This included behavioral aggregates (total spend, order count, price statistics),
+recency and duration features (days active, days since last order), per-order
+averages, and two domain-specific keyword flags (household consumables and
+kid/baby products) motivated by the hypothesis that purchasing patterns in these
+categories scale with household size. The SQL file (`feature_queries.sql`)
+additionally demonstrates how this pipeline would be built in a production
+data warehouse environment, including exploratory queries to validate feature
+assumptions against the target variable.
+
+**Machine Learning Models**
+I implemented and evaluated three of the four models: Lasso Regression, Random Forest, and XGBoost. This included data preparation specific to each model, hyperparameter tuning, feature importance analysis for each model, and the full 5-fold cross-validation evaluation framework used to compare all models fairly.
 
 ### Models
 
