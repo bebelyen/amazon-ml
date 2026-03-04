@@ -1,0 +1,1184 @@
+---
+title: "STAT101C Final Regression Projet"
+output:
+  pdf_document: default
+  html_document: default
+date: "2025-12-06"
+authors: Bebel Yen, Victoria Yee, Kaitlyn Wu
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, 
+  message = FALSE, 
+  warning = FALSE,
+  fig.width = 10,
+  fig.height = 6
+)
+```
+
+# Load Libraries
+
+```{r}
+library(tidyverse)
+library(lubridate)
+library(randomForest)
+library(glmnet)
+library(xgboost)
+```
+
+# 1. Load Data 
+
+```{r}
+survey <- read_csv("survey_train_test.csv")
+purch <- read_csv("amazon-purchases.csv")
+
+purch <- purch %>%
+  rename(Survey.ResponseID = `Survey ResponseID`)
+```
+
+# 2. Data Preprocessing
+
+## Date Processing and Line Total
+
+```{r}
+purch <- purch %>%
+  mutate(
+    `Order Date` = mdy(`Order Date`),
+    line_total = `Purchase Price Per Unit` * Quantity
+  )
+
+# head(purch)
+```
+
+## Income Distribution Across Amazon Usage Frequency
+```{r}
+chart_data <- survey %>%
+  filter(!is.na(Q.demos.income), !is.na(Q.amazon.use.how.oft)) %>%
+  count(Q.amazon.use.how.oft, Q.demos.income) %>%
+  group_by(Q.amazon.use.how.oft) %>%
+  mutate(prop = n / sum(n)) %>%
+  ungroup()
+
+ggplot(chart_data, aes(x = Q.amazon.use.how.oft, y = prop, fill = Q.demos.income)) +
+  geom_col(width = 0.7) + 
+  labs(title = "Income Distribution Across Amazon Usage Frequency", 
+       y = "Amazon Usage Frequency", x = "Proportion") + 
+  theme_minimal()
+```
+
+## Distribution of Household Size
+```{r, fig.height = 3}
+ggplot(survey, aes(x = Q.amazon.use.hh.size.num)) +
+  geom_histogram(binwidth = 1, fill = "lightblue", color = "white") +
+  labs(
+    title = "Distribution of Household Size",
+    x = "Household Size",
+    y = "Count"
+  ) +
+  theme_minimal()
+```
+
+# 3. Feature Engineering (Bebel Yen)
+
+## Basic Aggregates Per User
+
+```{r}
+agg_num <- purch %>%
+  group_by(Survey.ResponseID) %>%
+  summarise(
+    n_orders = n(),
+    total_quantity = sum(Quantity, na.rm = TRUE),
+    total_spend = sum(line_total, na.rm = TRUE),
+    mean_price = mean(`Purchase Price Per Unit`, na.rm = TRUE),
+    max_price = max(`Purchase Price Per Unit`, na.rm = TRUE),
+    min_price = min(`Purchase Price Per Unit`, na.rm = TRUE),
+    first_order_date = min(`Order Date`, na.rm = TRUE),
+    last_order_date = max(`Order Date`, na.rm = TRUE),
+    n_unique_states = n_distinct(`Shipping Address State`),
+    n_unique_titles = n_distinct(Title),
+    n_unique_asins = n_distinct(`ASIN/ISBN (Product Code)`),
+    n_unique_cats = n_distinct(Category)
+  ) %>%
+  ungroup()
+
+# head(agg_num)
+```
+
+## Duration and Recency Features
+
+```{r}
+max_date <- max(purch$`Order Date`, na.rm = TRUE)
+
+agg_num <- agg_num %>%
+  mutate(
+    days_active = as.numeric(difftime(last_order_date, first_order_date, units = "days")),
+    days_active = replace_na(days_active, 0),
+    days_since_last_order = as.numeric(difftime(max_date, last_order_date, units = "days"))
+  ) %>%
+  select(-first_order_date, -last_order_date)
+
+# head(agg_num)
+```
+
+```{r}
+par(mfrow = c(1, 2))
+hist(agg_num$total_spend, col = "blue", main = "Total Spend")
+hist(agg_num$total_quantity, col = "pink", main = "Total Quantity")
+```
+
+## Log-Transformed Features
+
+```{r}
+agg_num <- agg_num %>%
+  mutate(
+    log_total_spend = log1p(total_spend),
+    log_n_orders = log1p(n_orders),
+    log_total_quantity = log1p(total_quantity),
+    spend_per_order = total_spend / n_orders,
+    qty_per_order = total_quantity / n_orders
+  ) %>%
+  mutate(across(everything(), ~replace(., is.infinite(.), 0))) %>%
+  mutate(across(everything(), ~replace_na(., 0)))
+
+# summary(agg_num)
+```
+
+
+## Household Item Features
+
+```{r}
+household_keywords <- c(
+  "TOILET", "PAPER", "TOWEL", "NAPKIN", "CLEAN", "SOAP", "LAUNDRY", "GROCERY", "FOOD", "DRINK",
+  "WATER"
+)
+
+purch <- purch %>%
+  mutate(
+    Category_str = str_to_upper(as.character(Category)),
+    household_item = map_lgl(Category_str, ~any(str_detect(., household_keywords)))
+  )
+
+household_counts <- purch %>%
+  group_by(Survey.ResponseID) %>%
+  summarise(n_household_items = sum(household_item, na.rm = TRUE)) %>%
+  ungroup()
+
+agg_num <- agg_num %>%
+  left_join(household_counts, by = "Survey.ResponseID") %>%
+  mutate(n_household_items = replace_na(n_household_items, 0))
+
+# cat("Household items feature added\n")
+```
+
+
+## Kid/Baby/Children Item Features
+
+```{r}
+kid_keywords <- c(
+  "DIAPER", "DIAPERS", "WIPES", "WIPE", "BABY", "INFANT", "TODDLER", "TOY", "TOYS", "STROLLER",
+  "BOTTLE", "PACIFIER", "CRIB", "KIDS", "CHILD", "CHILDREN"
+)
+
+purch <- purch %>%
+  mutate(
+    kid_item = map_lgl(Category_str, ~any(str_detect(., kid_keywords)))
+  )
+
+kid_counts <- purch %>%
+  group_by(Survey.ResponseID) %>%
+  summarise(n_kid_items = sum(kid_item, na.rm = TRUE)) %>%
+  ungroup()
+
+agg_num <- agg_num %>%
+  left_join(kid_counts, by = "Survey.ResponseID") %>%
+  mutate(n_kid_items = replace_na(n_kid_items, 0))
+
+# cat("Kid items feature added\n")
+# cat("Users with kid items:", sum(agg_num$n_kid_items > 0), "\n")
+```
+
+
+```{r}
+data <- survey %>%
+  left_join(agg_num, by = "Survey.ResponseID")
+
+TARGET_COL <- "Q.amazon.use.hh.size.num"
+ID_COL <- "Survey.ResponseID"
+
+# cat("Combined dataset shape:", nrow(data), "x", ncol(data), "\n")
+```
+
+
+## Average Household Items Purchased by Amazon Usage
+```{r}
+amazon_summary <- data %>%
+  group_by(Q.amazon.use.hh.size.num) %>%
+  summarise(avg_household_items = mean(n_household_items, na.rm = TRUE)) %>%
+  ungroup()
+
+ggplot(amazon_summary, aes(x = Q.amazon.use.hh.size.num, y = avg_household_items)) +
+  geom_col(fill = "blue") +
+  labs(
+    title = "Average Household Items Purchased by Amazon Usage",
+    x = "Q.amazon.use.hh.size",
+    y = "Average Number of Household Items"
+  ) +
+  theme_minimal()
+```
+
+## Average Kid Items by Household Size
+```{r}
+amazon_summary <- data %>%
+  group_by(Q.amazon.use.hh.size.num) %>%
+  summarise(n_kid_items = mean(n_kid_items, na.rm = TRUE)) %>%
+  ungroup()
+
+ggplot(amazon_summary, aes(x = Q.amazon.use.hh.size.num, y = n_kid_items)) +
+  geom_col(fill = "pink") +
+  labs(
+    title = "Average Household Items Purchased by Amazon Usage",
+    x = "Q.amazon.use.hh.size",
+    y = "Average Number of Household Items"
+  ) +
+  theme_minimal()
+```
+
+# 5. Train/Test Split
+
+```{r}
+train_df <- data %>% filter(test == 0)
+test_df <- data %>% filter(test == 1)
+
+y <- train_df[[TARGET_COL]]
+
+# dropping comments 
+cols_to_drop <- c(
+  "Q.amazon.use.hh.size.num",   
+  "Q.amazon.use.hh.size",      
+  "Q.amazon.use.howmany",      
+  "test",
+  "Survey.ResponseID"
+)
+
+X <- train_df %>% select(-all_of(cols_to_drop))
+X_test <- test_df %>% select(-all_of(cols_to_drop))
+
+cat("Train shape:", nrow(X), "x", ncol(X), "\n")
+cat("Test shape:", nrow(X_test), "x", ncol(X_test), "\n\n")
+
+cat("Target distribution:\n")
+print(table(y))
+```
+
+## Prepare Data for Modeling
+
+```{r}
+# char to factor 
+X <- X %>% mutate(across(where(is.character), as.factor))
+X_test <- X_test %>% mutate(across(where(is.character), as.factor))
+
+for (col in names(X)) {
+  if (is.factor(X[[col]])) {
+    all_levels <- unique(c(levels(X[[col]]), levels(X_test[[col]])))
+    X[[col]] <- factor(X[[col]], levels = all_levels)
+    X_test[[col]] <- factor(X_test[[col]], levels = all_levels)
+  }
+}
+
+```
+
+## Handle Missing Values
+
+```{r}
+# check for NA
+cat("Missing values in X:\n")
+colSums(is.na(X)) %>% 
+  as.data.frame() %>%
+  filter(. > 0) %>%
+  arrange(desc(.))
+
+# numeric columns replace with median
+# factor colunms replace with mode or create "Missing" level
+
+X <- X %>%
+  mutate(across(where(is.numeric), ~replace_na(., median(., na.rm = TRUE)))) %>%
+  mutate(across(where(is.factor), ~fct_na_value_to_level(., level = "Missing")))
+
+# NAs in test 
+X_test <- X_test %>%
+  mutate(across(where(is.numeric), ~replace_na(., median(., na.rm = TRUE)))) %>%
+  mutate(across(where(is.factor), ~fct_na_value_to_level(., level = "Missing")))
+
+complete_rows <- !is.na(y)
+X <- X[complete_rows, ]
+y <- y[complete_rows]
+
+```
+
+# 6. Final Model Training
+
+## 6.1 Baseline Model
+
+
+```{r}
+
+mean_hh_size <- mean(y, na.rm = TRUE)
+
+# cat("Mean household size:", round(mean_hh_size, 4), "\n")
+
+# baseline predictions 
+baseline_train_preds <- rep(mean_hh_size, length(y))
+baseline_rmse <- sqrt(mean((y - baseline_train_preds)^2))
+
+# cat("Baseline RMSE:", round(baseline_rmse, 4), "\n")
+
+baseline_test_preds <- rep(mean_hh_size, nrow(X_test))
+baseline_test_preds <- round(baseline_test_preds)
+baseline_test_preds <- pmax(baseline_test_preds, 1)
+
+table(baseline_test_preds)
+```
+
+### Baseline Model Individual Predictions
+
+```{r}
+example_indices <- 1:3
+example_predictions <- tibble(
+  Example = paste("Person", 1:3),
+  `Actual Size` = y[example_indices],
+  `Predicted Size` = rep(mean_hh_size, 3),
+  Error = y[example_indices] - mean_hh_size
+) %>%
+  mutate(across(where(is.numeric), round, 2))
+
+# bar plot 
+example_long <- example_predictions %>%
+  select(Example, `Actual Size`, `Predicted Size`) %>%
+  pivot_longer(cols = -Example, names_to = "Type", values_to = "Value")
+
+baseline_examples_plot <- ggplot(example_long, aes(x = Example, y = Value, fill = Type)) +
+  geom_col(position = "dodge", width = 0.7) +
+  geom_text(aes(label = round(Value, 2)), 
+            position = position_dodge(width = 0.7), 
+            vjust = -0.5, size = 4) +
+  scale_fill_manual(values = c("Actual Size" = "blue", 
+                                "Predicted Size" = "pink")) +
+  labs(
+    title = "Baseline Model Examples",
+    x = NULL,
+    y = "Household Size",
+    fill = NULL
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5, size = 10, color = "gray40"),
+    legend.position = "top"
+  )
+
+baseline_examples_plot
+```
+
+## 6.2 Lasso Regression
+
+### Prepare Data for Lasso
+
+```{r}
+
+X_lasso <- model.matrix(~ . - 1, data = X)
+X_test_lasso <- model.matrix(~ . - 1, data = X_test)
+
+# cat("Lasso training matrix:", nrow(X_lasso), "x", ncol(X_lasso), "\n")
+# cat("Lasso test matrix:", nrow(X_test_lasso), "x", ncol(X_test_lasso), "\n")
+# cat("Length of y:", length(y), "\n")
+```
+
+### Train Lasso Model with Cross-Validation
+
+```{r}
+set.seed(42)
+
+# cross-validation
+cv_lasso <- cv.glmnet(
+  x = X_lasso,
+  y = y,
+  alpha = 1,        
+  nfolds = 10,
+  type.measure = "mse"
+)
+
+# plot(cv_lasso, main = "Lasso Cross-Validation")
+
+# cat("\nOptimal lambda (lambda.min):", cv_lasso$lambda.min, "\n")
+# cat("Lambda with 1-SE rule (lambda.1se):", cv_lasso$lambda.1se, "\n")
+
+# train final model 
+lasso_model <- glmnet(
+  x = X_lasso,
+  y = y,
+  alpha = 1,
+  lambda = cv_lasso$lambda.min
+)
+
+lasso_train_preds <- predict(lasso_model, newx = X_lasso, s = cv_lasso$lambda.min)[,1]
+lasso_train_rmse <- sqrt(mean((y - lasso_train_preds)^2))
+
+# cat("Lasso Training RMSE:", round(lasso_train_rmse, 4), "\n")
+```
+
+### Lasso Feature Importance
+
+```{r}
+# remove none zero
+lasso_coef <- coef(lasso_model, s = cv_lasso$lambda.min)
+lasso_coef_df <- data.frame(
+  Feature = rownames(lasso_coef),
+  Coefficient = as.vector(lasso_coef)
+) %>%
+  filter(Coefficient != 0, Feature != "(Intercept)") %>%
+  arrange(desc(abs(Coefficient)))
+
+# cat("\nNumber of non-zero coefficients:", nrow(lasso_coef_df), "out of", ncol(X_lasso), "\n")
+
+# plot
+lasso_coef_top <- lasso_coef_df %>%
+  head(15) %>%
+  mutate(Feature = fct_reorder(Feature, abs(Coefficient)))
+
+ggplot(lasso_coef_top, aes(x = Coefficient, y = Feature, fill = Coefficient > 0)) +
+  geom_col() +
+  scale_fill_manual(values = c("TRUE" = "darkblue", "FALSE" = "darkred"),
+                    labels = c("Negative", "Positive")) +
+  labs(
+    title = "Lasso: Top 15 Features by Coefficient Magnitude",
+    x = "Coefficient Value",
+    y = NULL,
+    fill = "Effect"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+    axis.text = element_text(size = 10),
+    legend.position = "bottom"
+  )
+
+knitr::kable(
+  lasso_coef_df %>% head(20),
+  digits = 4,
+  caption = "Top 20 Lasso Coefficients by Magnitude"
+)
+```
+
+### Lasso Predictions
+
+```{r}
+lasso_test_preds <- predict(lasso_model, newx = X_test_lasso, s = cv_lasso$lambda.min)[,1]
+```
+
+### Lasso Individual Predictions 
+
+```{r}
+intercept <- as.numeric(coef(lasso_model, s = cv_lasso$lambda.min)[1])
+
+for (i in 1:2) {
+  # print prediction
+  # cat(sprintf("\nPerson %d: Predicted household size = %.2f\n",
+  #             i, lasso_test_preds[i]))
+  
+  # top 3 
+  tibble(
+    Feature = lasso_coef_df$Feature,
+    Coef = lasso_coef_df$Coefficient,
+    Value = X_test_lasso[i, lasso_coef_df$Feature],
+    Contrib = Coef * Value
+  ) %>%
+    arrange(desc(abs(Contrib))) %>%
+    head(3) %>%
+    print()
+  
+  # cat(sprintf(
+  #  "Base (%.2f) + Contributions = %.2f, rounds to %.0f\n",
+  #  intercept,
+  #  intercept + sum(X_test_lasso[i, lasso_coef_df$Feature] * lasso_coef_df$Coefficient),
+  #  round(lasso_test_preds[i])
+  # ))
+}
+```
+
+	
+## 6.3 Random Forest Model
+
+### Train Random Forest
+
+```{r}
+
+set.seed(123)
+
+# search for the best mtry value
+tuned <- tuneRF(
+  x = X,
+  y = y,
+  ntreeTry = 300,          
+  stepFactor = 1.5,      
+  improve = 0.01,         
+  trace = TRUE,
+  plot = TRUE
+)
+
+best_mtry <- tuned[which.min(tuned[,"OOBError"]), "mtry"]
+# cat("Best mtry:", best_mtry, "\n")
+
+set.seed(123)
+
+rf_model <- randomForest(
+  x = X,
+  y = y,
+  mtry = best_mtry,
+  ntree = 500,         
+  importance = TRUE
+)
+
+print(rf_model)
+varImpPlot(rf_model)
+```
+
+### Random Forest Feature Importance
+
+## Feature Importance
+
+```{r}
+importance_df <- randomForest::importance(rf_model) %>%
+  as.data.frame() %>%
+  rownames_to_column("Feature") %>%
+  arrange(desc(IncNodePurity)) %>%
+  head(20)
+
+knitr::kable(importance_df, digits = 2, caption = "Top 20 Most Important Features")
+```
+
+### Random Forest Training Performance
+
+## Training Performance
+
+```{r}
+train_preds <- predict(rf_model, X)
+train_rmse <- sqrt(mean((y - train_preds)^2))
+
+# cat("Training RMSE:", round(train_rmse, 4), "\n")
+```
+
+### Random Forest Feature Importance Visualization
+
+# Feature Importance Visualization
+
+```{r}
+importance_df <- randomForest::importance(rf_model) %>%
+  as.data.frame() %>%
+  rownames_to_column("Feature") %>%
+  arrange(desc(IncNodePurity)) %>%
+  head(15) %>%
+  mutate(Feature = fct_reorder(Feature, IncNodePurity))
+
+ggplot(importance_df, aes(x = IncNodePurity, y = Feature)) +
+  geom_col(fill = "blue") +
+  labs(
+    title = "Random Forest Feature Importance (Top 15)",
+    x = "Importance (IncNodePurity)",
+    y = NULL
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+    axis.text = element_text(size = 10)
+  )
+```
+
+### Random Forest Individual Predictions 
+```{r}
+for (i in 1:2) {
+  pred <- predict(rf_model, X_test[i,])
+  
+  top_features <- importance_df$Feature[1:3]
+  
+  cat(sprintf("\nPerson %d Prediction Explanation:\n", i))
+  
+  cat("Predicted HH Size = ", round(pred, 2), " approx ", round(pred), "\n")
+
+  for (f in top_features) {
+    value <- X_test[i, f]
+    importance <- importance_df$IncNodePurity[importance_df$Feature == f]
+    cat(sprintf("Feature: %s, Value: %s, Importance: %.2f\n", f, value, importance))
+  }
+  
+  cat("\n")
+}
+
+```
+
+## 6.4 XGBoost Model
+
+### Prepare Data for XGBoost
+
+```{r}
+# numeric matrix
+X_xgb <- model.matrix(~. - 1, data = X)
+X_xgb_test <- model.matrix(~. - 1, data = X_test)
+
+# ensure test set has all columns from training
+missing_cols <- setdiff(colnames(X_xgb), colnames(X_xgb_test))
+if (length(missing_cols) > 0) {
+  for (col in missing_cols) {
+    X_xgb_test <- cbind(X_xgb_test, 0)
+    colnames(X_xgb_test)[ncol(X_xgb_test)] <- col
+  }
+}
+X_xgb_test <- X_xgb_test[, colnames(X_xgb)]
+
+# dmatrix objects
+dtrain <- xgb.DMatrix(data = X_xgb, label = y)
+dtest <- xgb.DMatrix(data = X_xgb_test)
+
+cat("XGBoost data prepared\n")
+cat("Training matrix dimensions:", dim(X_xgb), "\n")
+cat("Test matrix dimensions:", dim(X_xgb_test), "\n")
+```
+
+### Hyperparameter Tuning for XGBoost
+
+```{r}
+set.seed(123)
+
+# hyperparameter grid
+param_grid <- expand.grid(
+  max_depth = c(3, 5, 7),
+  eta = c(0.01, 0.1, 0.3),
+  subsample = c(0.7, 0.8, 1.0),
+  colsample_bytree = c(0.7, 0.8, 1.0)
+)
+
+# cat("Testing", nrow(param_grid), "hyperparameter combinations\n\n")
+
+tuning_results <- tibble()
+
+# rest 
+for (i in 1:min(10, nrow(param_grid))) {  # Test first 10 combinations for efficiency
+  params <- list(
+    objective = "reg:squarederror",
+    eval_metric = "rmse",
+    max_depth = param_grid$max_depth[i],
+    eta = param_grid$eta[i],
+    subsample = param_grid$subsample[i],
+    colsample_bytree = param_grid$colsample_bytree[i]
+  )
+  
+  cv_result <- xgb.cv(
+    params = params,
+    data = dtrain,
+    nrounds = 100,
+    nfold = 5,
+    early_stopping_rounds = 10,
+    verbose = FALSE
+  )
+  
+  best_rmse <- min(cv_result$evaluation_log$test_rmse_mean)
+  
+  tuning_results <- bind_rows(tuning_results, tibble(
+    max_depth = param_grid$max_depth[i],
+    eta = param_grid$eta[i],
+    subsample = param_grid$subsample[i],
+    colsample_bytree = param_grid$colsample_bytree[i],
+    cv_rmse = best_rmse
+  ))
+  
+}
+
+# select best parameters
+best_params_row <- tuning_results %>% arrange(cv_rmse) %>% slice(1)
+
+cat("\nBest Hyperparameters:\n")
+print(best_params_row)
+```
+
+### Train Final XGBoost Model with Best Parameters
+
+```{r}
+set.seed(123)
+
+best_params <- list(
+  objective = "reg:squarederror",
+  eval_metric = "rmse",
+  max_depth = best_params_row$max_depth,
+  eta = best_params_row$eta,
+  subsample = best_params_row$subsample,
+  colsample_bytree = best_params_row$colsample_bytree
+)
+
+xgb_model <- xgb.train(
+  params = best_params,
+  data = dtrain,
+  nrounds = 200,
+  verbose = FALSE
+)
+
+xgb_train_preds <- predict(xgb_model, dtrain)
+xgb_train_rmse <- sqrt(mean((y - xgb_train_preds)^2))
+
+# cat("XGBoost Model Training Complete\n")
+# cat("Training RMSE:", round(xgb_train_rmse, 4), "\n")
+```
+
+### XGBoost Feature Importance
+
+```{r}
+xgb_importance <- xgb.importance(model = xgb_model)
+
+cat("\nTop 10 Most Important Features (XGBoost):\n")
+print(head(xgb_importance, 10))
+
+xgb.plot.importance(head(xgb_importance, 15), 
+                    main = "Top 15 Features by Importance (XGBoost)")
+```
+
+### XGBoost Individual Predictions
+
+```{r}
+for (i in 1:2) {
+  pred <- predict(xgb_model, X_xgb_test[i, , drop = FALSE])
+  
+  top_features <- xgb_importance$Feature[1:3]
+  
+  cat(sprintf("\nPerson %d Prediction Explanation:\n", i))
+  cat("Predicted HH Size =", round(pred, 2), " ", round(pred), "\n")
+  
+  for (f in top_features) {
+    if (f %in% colnames(X_xgb_test)) {
+      value <- X_xgb_test[i, f]
+      gain <- xgb_importance$Gain[xgb_importance$Feature == f]
+      cat(sprintf("Feature: %s, Value: %.2f, Gain: %.4f\n", f, value, gain))
+    }
+  }
+  cat("\n")
+}
+```
+
+# 7. K-Fold Cross-Validation Setup
+
+```{r}
+set.seed(123)
+
+k_folds <- 5
+
+n <- nrow(X)
+fold_indices <- sample(rep(1:k_folds, length.out = n))
+
+X_lasso_full <- model.matrix(~ . - 1, data = X)
+
+cat("Fold sizes:\n")
+print(table(fold_indices))
+```
+
+## 7.1 Cross-Validation Function
+
+```{r}
+calculate_rmse <- function(actual, predicted) {
+  sqrt(mean((actual - predicted)^2))
+}
+
+# kfold CV for baseline 
+cv_baseline <- function(X, y, fold_indices, k_folds) {
+  rmse_scores <- numeric(k_folds)
+  
+  for (fold in 1:k_folds) {
+    train_idx <- fold_indices != fold
+    val_idx <- fold_indices == fold
+    
+    y_train <- y[train_idx]
+    y_val <- y[val_idx]
+    
+    mean_train <- mean(y_train)
+    val_preds <- rep(mean_train, sum(val_idx))
+    
+    rmse_scores[fold] <- calculate_rmse(y_val, val_preds)
+  }
+  
+  return(rmse_scores)
+}
+
+# kfold CV for lasso
+cv_lasso_kfold <- function(X_lasso, y, fold_indices, k_folds) {
+  rmse_scores <- numeric(k_folds)
+  
+  for (fold in 1:k_folds) {
+    train_idx <- fold_indices != fold
+    val_idx <- fold_indices == fold
+    
+    X_train <- X_lasso[train_idx, ]
+    X_val <- X_lasso[val_idx, ]
+    y_train <- y[train_idx]
+    y_val <- y[val_idx]
+    
+    cv_model <- cv.glmnet(X_train, y_train, alpha = 1, nfolds = 5)
+    
+    val_preds <- predict(cv_model, newx = X_val, s = "lambda.min")[,1]
+    
+    rmse_scores[fold] <- calculate_rmse(y_val, val_preds)
+  }
+  
+  return(rmse_scores)
+}
+
+# kfold CV for random forest
+cv_random_forest <- function(X, y, fold_indices, k_folds, mtry = NULL, ntree = 300) {
+  rmse_scores <- numeric(k_folds)
+  
+  if (is.null(mtry)) {
+    mtry <- floor(sqrt(ncol(X)))
+  }
+  
+  for (fold in 1:k_folds) {
+    train_idx <- fold_indices != fold
+    val_idx <- fold_indices == fold
+    
+    X_train <- X[train_idx, ]
+    X_val <- X[val_idx, ]
+    y_train <- y[train_idx]
+    y_val <- y[val_idx]
+    
+    rf_model <- randomForest(
+      x = X_train,
+      y = y_train,
+      mtry = mtry,
+      ntree = ntree,
+      importance = FALSE
+    )
+    
+    val_preds <- predict(rf_model, X_val)
+    rmse_scores[fold] <- calculate_rmse(y_val, val_preds)
+    cat("Fold", fold, "- RMSE:", round(rmse_scores[fold], 4), "\n")
+  }
+  
+  return(rmse_scores)
+}
+
+# kfold CV for xgboost
+cv_xgboost <- function(X_xgb, y, fold_indices, k_folds, params) {
+  rmse_scores <- numeric(k_folds)
+  
+  for (fold in 1:k_folds) {
+    train_idx <- fold_indices != fold
+    val_idx <- fold_indices == fold
+    
+    X_train <- X_xgb[train_idx, ]
+    X_val <- X_xgb[val_idx, ]
+    y_train <- y[train_idx]
+    y_val <- y[val_idx]
+    
+    dtrain_fold <- xgb.DMatrix(data = X_train, label = y_train)
+    dval_fold <- xgb.DMatrix(data = X_val, label = y_val)
+    
+    xgb_fold <- xgb.train(
+      params = params,
+      data = dtrain_fold,
+      nrounds = 200,
+      verbose = FALSE
+    )
+    
+    val_preds <- predict(xgb_fold, dval_fold)
+    
+    rmse_scores[fold] <- calculate_rmse(y_val, val_preds)
+    
+    cat("Fold", fold, "- RMSE:", round(rmse_scores[fold], 4), "\n")
+  }
+  return(rmse_scores)
+}
+```
+
+## 7.2 Perform K-Fold Cross-Validation for All Models
+
+### Baseline Model CV
+
+```{r}
+baseline_cv_scores <- cv_baseline(X, y, fold_indices, k_folds)
+
+cat("Fold RMSEs:", paste(round(baseline_cv_scores, 4), collapse = ", "), "\n")
+cat("Mean CV RMSE:", round(mean(baseline_cv_scores), 4), "\n")
+cat("Std CV RMSE:", round(sd(baseline_cv_scores), 4), "\n")
+```
+
+### Lasso Model CV
+
+```{r}
+lasso_cv_scores <- cv_lasso_kfold(X_lasso_full, y, fold_indices, k_folds)
+
+cat("Fold RMSEs:", paste(round(lasso_cv_scores, 4), collapse = ", "), "\n")
+cat("Mean CV RMSE:", round(mean(lasso_cv_scores), 4), "\n")
+cat("Std CV RMSE:", round(sd(lasso_cv_scores), 4), "\n")
+```
+
+### Random Forest Model CV
+
+```{r}
+set.seed(123)
+tuned_sample <- tuneRF(
+  x = X,
+  y = y,
+  ntreeTry = 300,
+  stepFactor = 1.5,
+  improve = 0.01,
+  trace = FALSE,
+  plot = FALSE
+)
+optimal_mtry <- tuned_sample[which.min(tuned_sample[,"OOBError"]), "mtry"]
+
+cat("Using mtry =", optimal_mtry, "for Random Forest CV\n\n")
+
+# kfold 
+rf_cv_scores <- cv_random_forest(X, y, fold_indices, k_folds, 
+                                  mtry = optimal_mtry, ntree = 300)
+
+cat("Fold RMSEs:", paste(round(rf_cv_scores, 4), collapse = ", "), "\n")
+cat("Mean CV RMSE:", round(mean(rf_cv_scores), 4), "\n")
+cat("Std CV RMSE:", round(sd(rf_cv_scores), 4), "\n")
+```
+
+### XGBoost Model CV
+
+```{r}
+cat("Using best hyperparameters from tuning\n\n")
+
+xgb_cv_scores <- cv_xgboost(X_xgb, y, fold_indices, k_folds, best_params)
+
+cat("\nFold RMSEs:", paste(round(xgb_cv_scores, 4), collapse = ", "), "\n")
+cat("Mean CV RMSE:", round(mean(xgb_cv_scores), 4), "\n")
+cat("Std CV RMSE:", round(sd(xgb_cv_scores), 4), "\n")
+```
+
+## 7.3 Cross-Validation Results Summary
+
+```{r}
+# comparison dataframe
+cv_results <- tibble(
+  Model = c("Baseline (Mean)", "Lasso", "Random Forest", "XGBoost"),
+  `Mean CV RMSE` = c(
+    mean(baseline_cv_scores),
+    mean(lasso_cv_scores),
+    mean(rf_cv_scores),
+    mean(xgb_cv_scores)
+  ),
+  `Std CV RMSE` = c(
+    sd(baseline_cv_scores),
+    sd(lasso_cv_scores),
+    sd(rf_cv_scores),
+    sd(xgb_cv_scores)
+  ),
+  `Min CV RMSE` = c(
+    min(baseline_cv_scores),
+    min(lasso_cv_scores),
+    min(rf_cv_scores),
+    min(xgb_cv_scores)
+  ),
+  `Max CV RMSE` = c(
+    max(baseline_cv_scores),
+    max(lasso_cv_scores),
+    max(rf_cv_scores),
+    max(xgb_cv_scores)
+  )
+)
+
+knitr::kable(
+  cv_results,
+  digits = 4,
+  caption = "5-Fold Cross-Validation Results",
+  align = "lrrrr"
+)
+
+# rank models by CV 
+cv_results %>%
+  arrange(`Mean CV RMSE`) %>%
+  select(Model, `Mean CV RMSE`) %>%
+  knitr::kable(digits = 4)
+```
+
+### Visualization of CV Results
+
+```{r}
+
+cv_plot_data <- tibble(
+  Model = rep(c("Baseline", "Lasso", "Random Forest", "XGBoost"), each = k_folds),
+  Fold = rep(1:k_folds, 4),
+  RMSE = c(baseline_cv_scores, lasso_cv_scores, rf_cv_scores, xgb_cv_scores)
+)
+
+# boxplot of CV scores
+ggplot(cv_plot_data, aes(x = Model, y = RMSE, fill = Model)) +
+  geom_boxplot(alpha = 0.7) +
+  geom_jitter(width = 0.2, alpha = 0.5, size = 2) +
+  labs(
+    title = "Cross-Validation RMSE by Model",
+    subtitle = paste0(k_folds, "-Fold Cross-Validation Results"),
+    x = "Model",
+    y = "RMSE"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5, size = 11),
+    legend.position = "none"
+  ) +
+  scale_fill_brewer(palette = "Set2")
+
+# line plot
+ggplot(cv_plot_data, aes(x = Fold, y = RMSE, color = Model, group = Model)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 3) +
+  labs(
+    title = "Model Performance Across CV Folds",
+    x = "Fold Number",
+    y = "RMSE"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+    legend.position = "bottom"
+  ) +
+  scale_color_brewer(palette = "Set1")
+```
+
+# 8. Model Comparison Summary
+
+```{r}
+# compare with tables 
+model_comparison <- tibble(
+  Model = c("Baseline (Mean)", "Lasso", "Random Forest", "XGBoost"),
+  `Training RMSE` = c(
+    round(baseline_rmse, 4),
+    round(lasso_train_rmse, 4),
+    round(train_rmse, 4),
+    round(xgb_train_rmse, 4)
+  ),
+  `Mean CV RMSE` = c(
+    round(mean(baseline_cv_scores), 4),
+    round(mean(lasso_cv_scores), 4),
+    round(mean(rf_cv_scores), 4),
+    round(mean(xgb_cv_scores), 4)
+  ),
+  `Std CV RMSE` = c(
+    round(sd(baseline_cv_scores), 4),
+    round(sd(lasso_cv_scores), 4),
+    round(sd(rf_cv_scores), 4),
+    round(sd(xgb_cv_scores), 4)
+  ),
+  `Number of Features` = c(
+    1,  
+    nrow(lasso_coef_df), 
+    ncol(X),
+    ncol(X_xgb)
+  ),
+  Notes = c(
+    "Predicts mean for all observations",
+    "Linear model with L1 regularization",
+    "Ensemble of 500 decision trees",
+    "Gradient boosted trees with tuned hyperparameters"
+  )
+)
+
+knitr::kable(
+  model_comparison,
+  caption = "Model Performance Comparison (Training vs Cross-Validation)",
+  align = c("l", "r", "r", "r", "r", "l")
+)
+
+cat("Model Rankings by Cross-Validation RMSE\n")
+model_comparison %>%
+  arrange(`Mean CV RMSE`) %>%
+  select(Model, `Mean CV RMSE`, `Std CV RMSE`) %>%
+  knitr::kable(digits = 4)
+
+
+cat("\nImprovement Over Baseline\n")
+baseline_cv_mean <- mean(baseline_cv_scores)
+lasso_cv_mean <- mean(lasso_cv_scores)
+rf_cv_mean <- mean(rf_cv_scores)
+xgb_cv_mean <- mean(xgb_cv_scores)
+
+cat("Lasso improvement:", round((1 - lasso_cv_mean/baseline_cv_mean) * 100, 2), "%\n")
+cat("Random Forest improvement:", round((1 - rf_cv_mean/baseline_cv_mean) * 100, 2), "%\n")
+cat("XGBoost improvement:", round((1 - xgb_cv_mean/baseline_cv_mean) * 100, 2), "%\n")
+```
+
+# 9. Generate Final Predictions (Best Model)
+
+```{r}
+# best model 
+best_model_name <- model_comparison %>%
+  arrange(`Mean CV RMSE`) %>%
+  slice(1) %>%
+  pull(Model)
+
+cat("Best Model by Cross-Validation:", best_model_name, "\n\n")
+
+# generate predictions with best performing model
+if (best_model_name == "XGBoost") {
+  test_preds <- predict(xgb_model, dtest)
+} else if (best_model_name == "Random Forest") {
+  test_preds <- predict(rf_model, X_test)
+} else if (best_model_name == "Lasso") {
+  test_preds <- predict(lasso_model, newx = X_lasso_test_scaled)[,1]
+} else {
+  test_preds <- rep(mean_y, nrow(X_test))
+}
+
+# household size must be at least 1
+test_preds <- pmax(test_preds, 1)
+
+kaggle <- tibble(
+  Survey.ResponseID = test_df$Survey.ResponseID,
+  Q.amazon.use.hh.size.num = test_preds
+)
+
+write_csv(kaggle, "submission.csv")
+cat("Submission file saved as 'submission.csv'\n")
+cat("Using predictions from:", best_model_name, "\n\n")
+cat("Prediction summary:\n")
+head(table(round(test_preds)))
+head(kaggle)
+```
+
+# 10. Summary Statistics
+
+```{r}
+cat("BASELINE MODEL:\n")
+cat("  Training RMSE:", round(baseline_rmse, 4), "\n")
+cat("  CV RMSE:", round(mean(baseline_cv_scores), 4), "\n")
+cat("  Method: Mean prediction\n\n")
+
+cat("LASSO REGRESSION:\n")
+cat("  Training RMSE:", round(lasso_train_rmse, 4), "\n")
+cat("  CV RMSE:", round(mean(lasso_cv_scores), 4), "\n")
+cat("  Optimal lambda:", round(cv_lasso$lambda.min, 6), "\n")
+cat("  Non-zero coefficients:", nrow(lasso_coef_df), "out of", ncol(X_lasso), "\n\n")
+
+cat("RANDOM FOREST MODEL:\n")
+cat("  Training RMSE:", round(train_rmse, 4), "\n")
+cat("  CV RMSE:", round(mean(rf_cv_scores), 4), "\n")
+cat("  Number of trees:", rf_model$ntree, "\n")
+cat("  Number of features:", ncol(X), "\n\n")
+
+cat("XGBOOST MODEL:\n")
+cat("  Training RMSE:", round(xgb_train_rmse, 4), "\n")
+cat("  CV RMSE:", round(mean(xgb_cv_scores), 4), "\n")
+cat("  Best hyperparameters:\n")
+cat("    max_depth:", best_params_row$max_depth, "\n")
+cat("    eta:", best_params_row$eta, "\n")
+cat("    subsample:", best_params_row$subsample, "\n")
+cat("    colsample_bytree:", best_params_row$colsample_bytree, "\n\n")
+
+cat("RMSE Improvement over Baseline (CV):\n")
+cat("  Lasso:", round((1 - lasso_cv_mean/baseline_cv_mean) * 100, 2), "%\n")
+cat("  Random Forest:", round((1 - rf_cv_mean/baseline_cv_mean) * 100, 2), "%\n")
+cat("  XGBoost:", round((1 - xgb_cv_mean/baseline_cv_mean) * 100, 2), "%\n\n")
+
+cat("BEST MODEL:", best_model_name, "\n")
+cat("  Mean CV RMSE:", round(min(model_comparison$`Mean CV RMSE`), 4), "\n")
+```
